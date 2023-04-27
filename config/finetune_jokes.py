@@ -2,7 +2,7 @@
 dataset = 'jokes'
 init_from = 'gpt2'
 
-out_dir = f'out-{dataset}-{init_from}'
+out_dir = f'out-jokes-gpt2'
 eval_interval = 5
 eval_iters = 40
 
