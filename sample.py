@@ -87,4 +87,13 @@ with torch.no_grad():
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, stop=stop)
             print(decode(y[0].tolist()))
-            print('---------------')
+            # print('---------------')
+
+            if stop:
+                while inp:=input():
+                    cont_ids = y[0].tolist() + encode(" "+inp) # stop should be "User:" due to " What" being a valid token in gpt-2
+                    x_cont = (torch.tensor(cont_ids, dtype=torch.long, device=device)[None, ...])
+                    y = model.generate(x_cont, max_new_tokens, temperature=temperature, top_k=top_k, stop=stop)
+                    printout = decode(y[0].tolist()).split(" "+inp)[-1]
+                    print(printout)
+                    # print('---------------')
