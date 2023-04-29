@@ -3,7 +3,7 @@ import time
 dataset = 'shakespeare'
 init_from = 'gpt2'
 
-out_dir = f'out-shakespeare-{init_from}-2'
+out_dir = f'out-lora-shakespeare-{init_from}-2'
 eval_interval = 5
 eval_iters = 40
 wandb_log = False # feel free to turn on
@@ -21,9 +21,14 @@ gradient_accumulation_steps = 32
 max_iters = 20
 
 # finetune at constant LR
-learning_rate = 3e-5
+learning_rate = 2e-4
 decay_lr = False
 
-device = "mps"
+device = 'mps'
 compile = False
 compute_grad_memory = True
+
+# LoRA parameters
+lora_rank = 8
+lora_alpha = 32
+lora_dropout = 0

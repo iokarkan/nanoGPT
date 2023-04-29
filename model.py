@@ -15,6 +15,97 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Overwriting the methods of nn.Linear:
+# https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
+class LoRALinear(nn.Linear):
+
+    def __init__(self,
+                 # nn.Linear parameters
+                 in_features: int,
+                 out_features: int,
+                 bias: bool = True,
+                 device=None,
+                 dtype=None,
+                 # LoRA parameters
+                 lora_rank: int = 0,
+                 lora_alpha: float = 0.0,
+                 lora_dropout: float = 0.0,
+                ) -> None:
+        nn.Linear.__init__(
+            self,
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype
+        )
+
+        # LoRA stuff
+        self.has_weights_merged = False
+        if lora_rank > 0:
+            self.lora_dropout = nn.Dropout(lora_dropout)
+
+            self.lora_scaling = lora_alpha / lora_rank
+            self.lora_A = nn.Parameter(torch.empty((lora_rank, self.in_features), device=device, dtype=dtype))
+            self.lora_B = nn.Parameter(torch.empty((self.out_features, lora_rank), device=device, dtype=dtype))
+
+            self.lora_A.requires_grad = False
+            self.lora_B.requires_grad = False
+
+            self.reset_parameters()
+
+    def is_lora(self) -> bool:
+        return hasattr(self, 'lora_A')
+
+    def reset_parameters(self) -> None:
+        nn.Linear.reset_parameters(self)
+        if self.is_lora():
+            torch.nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5)) # Same as nn.Linear
+            torch.nn.init.zeros_(self.lora_B)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        x = nn.Linear.forward(self, input)
+        if not self.has_weights_merged and self.is_lora():
+            # h = Wx + BAx * scaling
+            x += self.lora_scaling * F.linear(
+                F.linear(
+                    self.lora_dropout(input),
+                    self.lora_A
+                ),
+                self.lora_B
+            )
+        return x
+
+    def extra_repr(self) -> str:
+        out = nn.Linear.extra_repr(self)
+        if self.is_lora():
+            out += f', lora_rank={self.lora_A.shape[0]}, lora_scaling={self.lora_scaling}, lora_dropout={self.lora_dropout.p}'
+        return out
+
+    def train(self, mode: bool = True) -> "LoRALinear":
+        nn.Linear.train(self, mode)
+        if self.has_weights_merged and self.is_lora():
+            # de-merge weights, i.e., remove BA from W = W + BA
+            self.weight.data -= self.lora_scaling * self.lora_B @ self.lora_A
+            self.has_weights_merged = False
+        return self
+
+    def eval(self) -> "LoRALinear":
+        nn.Linear.eval(self)
+        if not self.has_weights_merged and self.is_lora():
+            # merge weights, i.e., add BA to W
+            self.weight.data += self.lora_scaling * self.lora_B @ self.lora_A
+            self.has_weights_merged = True
+        return self
+
+def get_lora_model(model: nn.Module) -> nn.Module:
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    return model
+
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -40,9 +131,23 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = LoRALinear(
+            in_features=config.n_embd,
+            out_features=3 * config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = LoRALinear(
+            in_features=config.n_embd,
+            out_features=config.n_embd,
+            bias=config.bias,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout
+        )
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -121,6 +226,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # LoRA parameters
+    lora_rank: int = 0
+    lora_alpha: float = 0.0
+    lora_dropout: float = 0.0
 
 class GPT(nn.Module):
 
@@ -212,10 +321,13 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
+        """
+        Loading pretrained GPT-2 models from HuggingFace hub.
+        """
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        assert all(k == 'dropout' or k.startswith("lora") for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -234,6 +346,13 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'lora_rank' in override_args:
+            print(f"overriding lora_rank and lora_alpha to {override_args['lora_rank']}")
+            config_args['lora_rank'] = override_args['lora_rank']
+            config_args['lora_alpha'] = override_args['lora_alpha']
+            if 'lora_dropout' in override_args:
+                print(f"overriding lora_dropout to {override_args['lora_dropout']}")
+                config_args['lora_dropout'] = override_args['lora_dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
@@ -252,7 +371,11 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        if config.lora_rank == 0:
+            assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        else:
+            # Subtract the LoRA parameters from len(sd_keys)
+            assert len(sd_keys_hf) == len(sd_keys) - 4 * config.n_layer
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -274,6 +397,10 @@ class GPT(nn.Module):
         weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
         We are then returning the PyTorch optimizer object.
         """
+
+        if self.config.lora_rank > 0:
+            # No special treatment for LoRA
+            return torch.optim.AdamW(self.parameters(), lr=learning_rate, betas=betas, weight_decay=weight_decay)
 
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
