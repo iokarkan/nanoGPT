@@ -242,7 +242,7 @@ class GPT(nn.Module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type, load_in_8bit=int8_quantization, device_map='auto')
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type, load_in_8bit=int8_quantization, device_map='auto', max_memory={0: f'{int(torch.cuda.mem_get_info()[0]/1024**3)-2}GiB', "cpu": "30GiB"})
         print(f"memory footprint {model_hf.get_memory_footprint()/1024**2:.2f} MB")
         sd_hf = model_hf.state_dict()
 
